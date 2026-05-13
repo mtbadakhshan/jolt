@@ -1,0 +1,33 @@
+[package]
+name = "fn-dsa-verify"
+version = "0.1.0"
+edition = "2021"
+default-run = "fn-dsa-verify"
+
+[dependencies]
+jolt-sdk = { workspace = true, features = ["host"] }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+guest = { package = "fn-dsa-verify-guest", path = "./guest" }
+
+# Host uses the umbrella `fn-dsa` crate so we can generate a keypair and a
+# signature to hand to the guest. The guest itself depends only on
+# `fn-dsa-vrfy` (verify-only path).
+fn-dsa = { workspace = true }
+# Deterministic CSPRNG for keygen + signing. We avoid `rand::OsRng` so the
+# example produces a byte-for-byte reproducible signature on every run,
+# which makes the static `analyze_elf.py` cross-checks meaningful.
+rand_chacha = { workspace = true }
+rand = { workspace = true, default-features = false, features = ["std_rng"] }
+
+# Used by the symbol-profile binary (src/bin/profile.rs) only.
+object = { workspace = true, features = ["read"] }
+rustc-demangle = "0.1"
+
+[[bin]]
+name = "fn-dsa-verify"
+path = "src/main.rs"
+
+[[bin]]
+name = "fn-dsa-profile"
+path = "src/bin/profile.rs"

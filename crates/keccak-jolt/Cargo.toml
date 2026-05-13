@@ -1,0 +1,18 @@
+[package]
+# Must match the upstream crate name so `[patch.crates-io] keccak = ...` slots
+# this crate in for `keccak 0.2.x`.
+name = "keccak"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+description = "Workspace-local stub of `keccak` that routes `Keccak::with_f1600` through the Jolt Keccak inline on RISC-V."
+repository = "https://github.com/a16z/jolt"
+
+# Patched by the Jolt workspace; never published.
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+jolt-inlines-keccak256 = { workspace = true }

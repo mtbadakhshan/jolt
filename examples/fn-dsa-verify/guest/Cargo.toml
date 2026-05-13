@@ -1,0 +1,15 @@
+[package]
+name = "fn-dsa-verify-guest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+guest = []
+
+[dependencies]
+jolt = { package = "jolt-sdk", path = "../../../jolt-sdk" }
+# Verification-only sub-crate. We deliberately avoid pulling `fn-dsa` (the
+# umbrella crate) because that drags in `fn-dsa-kgen` and `fn-dsa-sign`,
+# which exist purely for the host side and contain floating-point code
+# paths gated to x86/aarch64 (harmless on RV64 but unnecessary weight).
+fn-dsa-vrfy = { workspace = true }

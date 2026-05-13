@@ -1,0 +1,37 @@
+[package]
+name = "mldsa-verify"
+version = "0.1.0"
+edition = "2021"
+default-run = "mldsa-verify"
+
+[dependencies]
+jolt-sdk = { workspace = true, features = ["host"] }
+# Pulls in the Keccak inline's `register_inlines!` so the tracer recognises
+# the custom opcodes emitted by `crates/keccak-jolt` in the guest ELF.
+jolt-inlines-keccak256 = { workspace = true, features = ["host"] }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+guest = { package = "mldsa-verify-guest", path = "./guest" }
+
+# Used by the host to generate a test vector that the guest then verifies.
+ml-dsa = { version = "0.1.0-rc.11", default-features = false, features = [
+  "alloc",
+  "rand_core",
+] }
+rand = { workspace = true, default-features = false, features = ["std_rng"] }
+signature = { version = "3", default-features = false }
+
+# Used by the symbol-profile binary (src/bin/profile.rs) only.
+object = { workspace = true, features = ["read"] }
+rustc-demangle = "0.1"
+
+[[bin]]
+name = "mldsa-verify"
+path = "src/main.rs"
+
+[[bin]]
+name = "mldsa-profile"
+path = "src/bin/profile.rs"
+
+[package.metadata.cargo-machete]
+ignored = ["jolt-inlines-keccak256"]

@@ -26,6 +26,7 @@ keywords = ["SNARK", "cryptography", "proofs"]
 members = [
   "crates/jolt-crypto",
   "crates/jolt-program",
+  "crates/keccak-jolt",
   "crates/jolt-poly",
   "crates/jolt-lookup-tables",
   "crates/jolt-r1cs",
@@ -102,6 +103,10 @@ members = [
   "examples/modinv/guest",
   "examples/advice-demo",
   "examples/advice-demo/guest",
+  "examples/mldsa-verify",
+  "examples/mldsa-verify/guest",
+  "examples/fn-dsa-verify",
+  "examples/fn-dsa-verify/guest",
   "examples/sig-recovery/host",
   "examples/sig-recovery/guest",
   "zklean-extractor",
@@ -162,12 +167,27 @@ lto = "fat"
 strip = false
 codegen-units = 1
 
+# Symbol- and DWARF-friendly variant of `guest`. Selected per-example via the
+# `profile = "guest-profile"` attribute on `#[jolt::provable]`. Trades fat LTO
+# for thin so functions stay separate; keeps line tables so PCs can be mapped
+# back to symbols. Cycle counts will be slightly higher than the production
+# `guest` build because of less inlining — use for profiling, not perf claims.
+[profile.guest-profile]
+inherits = "guest"
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 16
+
 [patch.crates-io]
 ark-bn254 = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 allocative = { git = "https://github.com/facebookexperimental/allocative", rev = "85b773d85d526d068ce94724ff7a7b81203fc95e" }
+# Route `keccak::Keccak::with_f1600` through the Jolt Keccak inline on RISC-V
+# (and a soft fallback on host). Affects only consumers of `keccak 0.2.x`
+# (notably `sha3 0.11` → `ml-dsa`); other versions are unaffected.
+keccak = { path = "./crates/keccak-jolt" }
 
 [workspace.metadata.cargo-machete]
 ignored = ["jolt-sdk"]
@@ -361,6 +381,10 @@ zeroos-build = { git = "https://github.com/LayerZero-Labs/ZeroOS.git", default-f
 zeroos = { git = "https://github.com/LayerZero-Labs/ZeroOS.git", default-features = false, rev = "3b132ce862ba6769a4261d151f69ff32c5f0dc30" }
 cfg-if = "1.0"
 riscv = { version = "0.16", default-features = false }
+
+# FN-DSA (Falcon) — for the fn-dsa-verify example
+fn-dsa = { version = "0.3", default-features = false }
+fn-dsa-vrfy = { version = "0.3", default-features = false }
 
 # Ethereum/Crypto (for sig-recovery example)
 alloy-primitives = "1"

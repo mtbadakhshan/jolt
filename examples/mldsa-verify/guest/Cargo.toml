@@ -1,0 +1,14 @@
+[package]
+name = "mldsa-verify-guest"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+guest = []
+
+[dependencies]
+jolt = { package = "jolt-sdk", path = "../../../jolt-sdk" }
+ml-dsa = { version = "0.1.0-rc.11", default-features = false, features = [
+  "alloc",
+] }
+signature = { version = "3", default-features = false }
