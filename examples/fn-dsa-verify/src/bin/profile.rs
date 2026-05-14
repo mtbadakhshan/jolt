@@ -20,6 +20,9 @@ use fn_dsa::{
     sign_key_size, signature_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard,
     SigningKey, SigningKeyStandard, DOMAIN_NONE, FN_DSA_LOGN_512, HASH_ID_RAW,
 };
+use fn_dsa_vrfy::{compute_hashed_key, hash_to_point};
+use guest::precomputed::serialize_c;
+use jolt_inlines_keccak256 as _;
 use object::{Object, ObjectSymbol, SymbolKind};
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -93,7 +96,16 @@ fn main() {
     let mut sig_rng = ChaCha20Rng::from_seed([0x5Au8; 32]);
     sk.sign(&mut sig_rng, &DOMAIN_NONE, &HASH_ID_RAW, &msg, &mut sig);
 
-    let trace_out = guest::trace_fn_dsa_verify(&vrfy_key, &sig, &msg).expect("tracer failed");
+    // Host-side precomputation (matches main.rs).
+    let hashed_key = compute_hashed_key(&vrfy_key);
+    let n = 1usize << FN_DSA_LOGN_512;
+    let nonce = &sig[1..41];
+    let mut c = vec![0u16; n];
+    hash_to_point(nonce, &hashed_key, &DOMAIN_NONE, &HASH_ID_RAW, &msg, &mut c);
+    let c_bytes = serialize_c(&c);
+
+    let trace_out = guest::trace_fn_dsa_verify(&vrfy_key, &sig, &msg, &hashed_key, &c_bytes)
+        .expect("tracer failed");
     let rows = trace_out.trace.rows();
     println!("trace length: {} rows", rows.len());
 

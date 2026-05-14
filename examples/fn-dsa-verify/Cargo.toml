@@ -6,6 +6,9 @@ default-run = "fn-dsa-verify"
 
 [dependencies]
 jolt-sdk = { workspace = true, features = ["host"] }
+# Pulls in the Keccak inline's `register_inlines!` so the tracer recognises
+# the custom opcodes emitted by fn-dsa-comm-jolt's SHAKE backend.
+jolt-inlines-keccak256 = { workspace = true, features = ["host"] }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 guest = { package = "fn-dsa-verify-guest", path = "./guest" }
@@ -14,15 +17,19 @@ guest = { package = "fn-dsa-verify-guest", path = "./guest" }
 # signature to hand to the guest. The guest itself depends only on
 # `fn-dsa-vrfy` (verify-only path).
 fn-dsa = { workspace = true }
-# Deterministic CSPRNG for keygen + signing. We avoid `rand::OsRng` so the
-# example produces a byte-for-byte reproducible signature on every run,
-# which makes the static `analyze_elf.py` cross-checks meaningful.
+# Resolves through `[patch.crates-io] fn-dsa-vrfy = ...` to
+# `crates/fn-dsa-vrfy-jolt`, which adds `compute_hashed_key`,
+# `hash_to_point`, `from_parts`, and `verify_with_precomputed_c`.
+fn-dsa-vrfy = { workspace = true }
 rand_chacha = { workspace = true }
 rand = { workspace = true, default-features = false, features = ["std_rng"] }
 
 # Used by the symbol-profile binary (src/bin/profile.rs) only.
 object = { workspace = true, features = ["read"] }
 rustc-demangle = "0.1"
+
+[package.metadata.cargo-machete]
+ignored = ["jolt-inlines-keccak256"]
 
 [[bin]]
 name = "fn-dsa-verify"

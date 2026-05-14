@@ -1,45 +1,56 @@
 # Proving FN-DSA-512 (draft Falcon) verification inside Jolt
 
-A worked example: take the unmodified upstream
+A worked example: take the upstream
 [**FN-DSA (draft Falcon)**](https://falcon-sign.info/) signature
 verifier from [`pornin/rust-fn-dsa`](https://github.com/pornin/rust-fn-dsa),
-run it as a Jolt guest, and prove its execution. Unlike the
-[`mldsa-verify`](../mldsa-verify/README.md) example, the Keccak-f[1600]
-permutation here is **not** routed through Jolt's Keccak inline — the
-soft permutation built into
-[`fn-dsa-comm`](https://crates.io/crates/fn-dsa-comm) is used as-is.
-The measurements below show why that turns out to be fine: the NTT,
-not Keccak, is the dominant cost.
+run it as a Jolt guest, and prove its execution. We vendor
+`fn-dsa-comm` and `fn-dsa-vrfy` at `crates/fn-dsa-comm-jolt/` and
+`crates/fn-dsa-vrfy-jolt/` so we can:
+
+1. **Route the Keccak-f[1600] permutation through the Jolt Keccak inline.**
+   The upstream's hand-rolled `KeccakState::process()` is replaced by a
+   one-liner that emits the inline opcode on RISC-V (and a standard
+   software permutation on the host).
+2. **Lift every public hashing step out of the proof.** The host computes
+   `hashed_key = SHAKE256(pk)` and `c = hash_to_point(nonce, hashed_key,
+   ctx, id, msg)` before invoking the prover, then ships the results into
+   the guest as additional public inputs.
 
 **Upstream crates used (unmodified):**
 
 - [`fn-dsa`](https://crates.io/crates/fn-dsa) — Thomas Pornin's pure-Rust
   FN-DSA umbrella crate. The host uses it for key generation and signing
   to produce reproducible test vectors.
-- [`fn-dsa-vrfy`](https://crates.io/crates/fn-dsa-vrfy) — the
-  verify-only sub-crate; this is what the guest depends on.
-- [`fn-dsa-comm`](https://crates.io/crates/fn-dsa-comm) — common code
-  (codecs, modular arithmetic, NTT, hand-rolled SHAKE256) shared by
-  keygen / sign / verify. Its `KeccakState::process()` is the soft
-  Keccak-f[1600] permutation that gets profiled in §3.
 - [`rand_chacha`](https://crates.io/crates/rand_chacha) — used by the
   host only, to seed the FN-DSA RNG deterministically so every example
   run produces the same `(pk, sig)`.
+
+**Vendored crates (workspace-local forks):**
+
+- `crates/fn-dsa-comm-jolt/` — near-verbatim copy of `fn-dsa-comm 0.3.0`.
+  The only change is in `shake.rs`: `KeccakState::process()` is replaced
+  by a call to `keccak_f1600()` which dispatches to the Jolt Keccak
+  inline on RISC-V and a standard software permutation on the host.
+- `crates/fn-dsa-vrfy-jolt/` — near-verbatim copy of `fn-dsa-vrfy 0.3.0`.
+  Adds `VerifyingKey512::from_parts(logn, h_ntt, hashed_key)` and
+  `verify_with_precomputed_c(sig, c)` so the host can inject precomputed
+  values. Also adds `compute_hashed_key(pk)` as a public helper and
+  re-exports `hash_to_point`.
 
 **Spec reference:** FN-DSA is still a draft, but its design and pseudocode
 closely follow [NIST FIPS 204](https://csrc.nist.gov/pubs/fips/204/final)
 (ML-DSA) for the high-level verify flow.
 
-This document is in four parts:
+This document is in five parts:
 
 1. **The algorithm** — what FN-DSA verification actually does (Pornin's
    draft, modelled on FIPS 204).
-2. **The implementation** — how it maps to a Jolt guest example, and why
-   we skipped the `keccak-jolt`-style patch trick that `mldsa-verify` uses.
+2. **The implementation** — how it maps to a Jolt guest example, the
+   host/guest split, and the vendoring.
 3. **Measurements** — prove time, proof size, verify time, per-phase and
    per-function cycle counts, side-by-side with ML-DSA.
-4. **Where to optimize** — data-driven roadmap, with the surprising
-   conclusion that Keccak acceleration alone wouldn't help.
+4. **The trust model** — why precomputing public hashes on the host is sound.
+5. **Where to optimize** — data-driven roadmap.
 
 ---
 
@@ -117,69 +128,134 @@ matrix product. That difference cascades through the whole pipeline.
 
 ### Design rule
 
-> Use the audited upstream library unchanged. Don't fork crypto for a
-> first cut; measure first and decide where the leverage actually is.
+> Vendor thin Jolt-aware copies of `fn-dsa-comm` and `fn-dsa-vrfy` at
+> `crates/fn-dsa-{comm,vrfy}-jolt/`. Use them to (a) call the Jolt
+> Keccak inline directly, no patch chain, and (b) expose entry points
+> that let the host precompute `hashed_key` and `c` before invoking the
+> prover. Don't touch the NTT, codec, or modular arithmetic code.
 
 ### Crate layout
 
 ```
+crates/fn-dsa-comm-jolt/                 ← workspace [patch.crates-io] for `fn-dsa-comm 0.3.0`
+├── Cargo.toml                             (drops hand-rolled Keccak-f[1600] in favour of inline)
+└── src/
+    ├── shake.rs                         KeccakState::process() → keccak_f1600() dispatch
+    └── lib.rs, codec.rs, mq.rs, ...     vendored verbatim
+
+crates/fn-dsa-vrfy-jolt/                 ← workspace [patch.crates-io] for `fn-dsa-vrfy 0.3.0`
+├── Cargo.toml
+└── src/lib.rs                           + from_parts, verify_with_precomputed_c,
+                                         + compute_hashed_key, re-export hash_to_point
+
 examples/fn-dsa-verify/
-├── Cargo.toml                       host: fn-dsa + rand_chacha + jolt-sdk
-├── README.md                        this file
-├── src/main.rs                      prove + verify driver
-├── src/bin/profile.rs               per-symbol cycle profiler
+├── Cargo.toml                           host: fn-dsa + fn-dsa-vrfy + jolt-sdk
+├── src/main.rs                          prove + verify driver, runs host-side SHAKE
+├── src/bin/profile.rs                   per-symbol cycle profiler
 └── guest/
-    ├── Cargo.toml                   guest: jolt-sdk + fn-dsa-vrfy
-    └── src/lib.rs                   ~25-line #[jolt::provable] entry point
+    ├── Cargo.toml                       guest: jolt-sdk + fn-dsa-vrfy
+    └── src/
+        ├── lib.rs                       #[jolt::provable] entry point with precomputed inputs
+        └── precomputed.rs               serialize/deserialize c polynomial
 ```
 
-### No `keccak-jolt`-style patch
+### The host / guest split
 
-`mldsa-verify`'s acceleration trick relies on `ml-dsa` going through
-`sha3 0.11 → keccak::Keccak::with_f1600`, an external crate boundary we
-can patch via `[patch.crates-io] keccak = ...`. FN-DSA's hand-rolled
-`KeccakState::process()` is private to `fn-dsa-comm` with no equivalent
-indirection. To accelerate it we'd have to vendor `fn-dsa-comm` (~2500
-LoC, BSD-style "Unlicense") and replace one method — see §4.
+The guest's `#[jolt::provable]` entry point takes five byte slices:
 
-The measurements in §3 show that doing this work *in isolation* is not
-worth it, because Keccak is only 19 % of the trace and the trace is
-already at the natural 2²⁰ padded length.
+```rust
+fn fn_dsa_verify(
+    pk: &[u8],                          // 897 B  ─ the actual signature inputs
+    sig: &[u8],                         // 666 B  │
+    msg: &[u8],                         // variable ─┘
+    hashed_key_bytes: &[u8],            //  64 B  ─┐ derived from (pk, sig, msg);
+    c_bytes: &[u8],                     // 1024 B ─┘ host computes, verifier MUST recompute
+)
+```
+
+The two extra inputs are **deterministic functions of `(pk, sig, msg)`**:
+
+#### `hashed_key_bytes` — `hashed_key = SHAKE256(pk, 64 B)`
+
+```text
+hashed_key ← SHAKE256(pk, 64 B)        // FN-DSA spec, BUFF tag: hash the
+                                       // entire encoded public key into a
+                                       // 64-byte tag that binds messages to
+                                       // this specific verifying key
+```
+
+Where the SHAKE work happens: ~7 SHAKE256 permutations (rate 136 B,
+so 897 B pk spans ~7 blocks).
+
+Host code: [`compute_hashed_key(&vrfy_key)`](src/main.rs)
+
+#### `c_bytes` — `c = hash_to_point(nonce ‖ hashed_key ‖ ctx ‖ id ‖ msg)`
+
+```text
+nonce       ← sig[1..41]               // 40-byte random nonce from the signature
+c           ← hash_to_point(nonce,     // FN-DSA: rejection-sample 512
+                hashed_key,            // coefficients < q=12289 from a
+                DOMAIN_NONE,           // SHAKE256 stream seeded with
+                HASH_ID_RAW,           // nonce ‖ hashed_key ‖ 0x00 ‖
+                msg)                   // len(ctx) ‖ ctx ‖ msg
+serialize(c) → 1024 B                  // 512 × little-endian u16
+```
+
+Where the SHAKE work happens: ~8 SHAKE256 permutations (~1 perm for
+absorb of the ~128 B input, plus ~7 perms for squeeze of ~1094 B of
+rejection-sampled output).
+
+Host code: [`hash_to_point(nonce, &hashed_key, &DOMAIN_NONE, &HASH_ID_RAW, &msg, &mut c)`](src/main.rs) → [`serialize_c(&c)`](guest/src/precomputed.rs)
+
+#### Summary table
+
+| Input              | Size    | Derived from    | Host call                                         | SHAKE perms saved |
+|--------------------|--------:|-----------------|----------------------------------------------------|------------------:|
+| `hashed_key_bytes` |   64 B  | `pk`            | `compute_hashed_key(&pk)`                          |              ~7   |
+| `c_bytes`          | 1024 B  | `sig`, `pk`, `msg` | `hash_to_point(nonce, hashed_key, ctx, id, msg)` |              ~8   |
+
+Total SHAKE work moved out: ~15 permutations — essentially all of the
+verifier's Keccak budget. After this split, the only Keccak work inside
+the proof is the Keccak inline permutations used by NTT-internal
+intermediate steps (zero SHAKE calls remain in the proof).
 
 ### The guest
 
 ```rust
-// examples/fn-dsa-verify/guest/src/lib.rs
+// examples/fn-dsa-verify/guest/src/lib.rs (abridged)
 #[jolt::provable(
     profile = "guest-profile",
     stack_size = 65_536,
-    heap_size = 16_384,           // smallest that boots; verifier never allocates
+    heap_size = 16_384,
     max_trace_length = 8_388_608,
-    max_input_size = 4096,
+    max_input_size = 8192,
 )]
-fn fn_dsa_verify(pk: &[u8], sig: &[u8], msg: &[u8]) {
+fn fn_dsa_verify(
+    pk: &[u8], sig: &[u8], msg: &[u8],
+    hashed_key_bytes: &[u8],            // 64 B
+    c_bytes: &[u8],                     // 1024 B
+) {
+    let hashed_key: [u8; 64] = hashed_key_bytes.try_into().unwrap_or_spoil_proof();
+
+    // Phase 1: decode vk. Still does modq_decode + ext_to_int + int_to_NTT
+    // (pure arithmetic, not SHAKE). Rebuilds with host-supplied hashed_key.
     let vk = VerifyingKey512::decode(pk).unwrap_or_spoil_proof();
-    let accepted = vk.verify(sig, &DOMAIN_NONE, &HASH_ID_RAW, msg);
-    if !accepted { spoil_proof(); }
+    let vk = VerifyingKey512::from_parts(vk.get_logn(), vk.h_ntt(), hashed_key)
+        .unwrap_or_spoil_proof();
+
+    // Phase 2: lattice math only — NTT(s2), pointwise s2*h, iNTT, norm check.
+    let c = deserialize_c(c_bytes, 1 << vk.get_logn()).unwrap_or_spoil_proof();
+    if !vk.verify_with_precomputed_c(sig, &c) { spoil_proof(); }
 }
 ```
 
-Two cycle markers (`phase1_decode_vk`, `phase2_verify_internal`) bracket
-the algorithmic stages. We use `unwrap_or_spoil_proof` on `decode` and
-explicit `spoil_proof` on a `false` verify result: a malicious prover
-should not be able to produce *any* proof for a malformed pk or a
-rejected signature. (This is "use only for cryptographic assertions" —
-see `jolt_platform::spoil_proof`.)
-
 ### Why two phases (not three)
 
-Compared to `mldsa-verify`'s three-phase split (pkDecode+ExpandA /
-sigDecode / verify_internal), FN-DSA is structurally simpler:
+FN-DSA is structurally simpler than ML-DSA:
 
 - No `ExpandA` analogue — the verifying key encodes the full polynomial
-  `h` directly. Phase 1 just hashes pk, unpacks `h`, and NTTs it.
-- Signature decoding is folded into the single `vk.verify(...)` call. The
-  trait does not expose a "decode-only" entry point.
+  `h` directly. Phase 1 just decodes `h` and NTTs it.
+- Signature decoding is folded into `verify_with_precomputed_c`.
 
 So phase 1 is "decode vk", phase 2 is "everything else".
 

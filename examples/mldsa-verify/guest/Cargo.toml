@@ -8,7 +8,10 @@ guest = []
 
 [dependencies]
 jolt = { package = "jolt-sdk", path = "../../../jolt-sdk" }
+# Resolves through `[patch.crates-io] ml-dsa = ...` to `crates/ml-dsa-jolt`,
+# which adds `VerifyingKey::new_with_precomputed` / `raw_verify_with_precomputed`
+# and routes SHAKE128/256 through the Jolt Keccak inline directly.
 ml-dsa = { version = "0.1.0-rc.11", default-features = false, features = [
   "alloc",
 ] }
-signature = { version = "3", default-features = false }
+hybrid-array = { version = "0.4", default-features = false, features = ["extra-sizes"] }

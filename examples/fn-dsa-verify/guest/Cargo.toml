@@ -8,8 +8,7 @@ guest = []
 
 [dependencies]
 jolt = { package = "jolt-sdk", path = "../../../jolt-sdk" }
-# Verification-only sub-crate. We deliberately avoid pulling `fn-dsa` (the
-# umbrella crate) because that drags in `fn-dsa-kgen` and `fn-dsa-sign`,
-# which exist purely for the host side and contain floating-point code
-# paths gated to x86/aarch64 (harmless on RV64 but unnecessary weight).
+# Resolves through `[patch.crates-io] fn-dsa-vrfy = ...` to
+# `crates/fn-dsa-vrfy-jolt`, which adds `from_parts` and
+# `verify_with_precomputed_c`.
 fn-dsa-vrfy = { workspace = true }

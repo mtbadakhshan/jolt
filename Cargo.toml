@@ -27,6 +27,9 @@ members = [
   "crates/jolt-crypto",
   "crates/jolt-program",
   "crates/keccak-jolt",
+  "crates/ml-dsa-jolt",
+  "crates/fn-dsa-comm-jolt",
+  "crates/fn-dsa-vrfy-jolt",
   "crates/jolt-poly",
   "crates/jolt-lookup-tables",
   "crates/jolt-r1cs",
@@ -184,10 +187,16 @@ ark-ff = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist
 ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout" }
 allocative = { git = "https://github.com/facebookexperimental/allocative", rev = "85b773d85d526d068ce94724ff7a7b81203fc95e" }
-# Route `keccak::Keccak::with_f1600` through the Jolt Keccak inline on RISC-V
-# (and a soft fallback on host). Affects only consumers of `keccak 0.2.x`
-# (notably `sha3 0.11` → `ml-dsa`); other versions are unaffected.
-keccak = { path = "./crates/keccak-jolt" }
+# Substitute the workspace-local `crates/ml-dsa-jolt` for upstream `ml-dsa
+# 0.1.0-rc.11`. The local crate adds public entry points so the host can
+# precompute `A_hat`, `tr`, `μ`, `c` outside the Jolt guest, and rewires
+# SHAKE128/256 to call the Jolt Keccak inline directly (no `sha3` / `keccak`
+# crates on the path).
+ml-dsa = { path = "./crates/ml-dsa-jolt" }
+# Substitute `fn-dsa-comm` and `fn-dsa-vrfy` so FN-DSA's SHAKE goes through
+# the Jolt Keccak inline and the host can precompute hashed_key + hash_to_point.
+fn-dsa-comm = { path = "./crates/fn-dsa-comm-jolt" }
+fn-dsa-vrfy = { path = "./crates/fn-dsa-vrfy-jolt" }
 
 [workspace.metadata.cargo-machete]
 ignored = ["jolt-sdk"]
@@ -385,6 +394,7 @@ riscv = { version = "0.16", default-features = false }
 # FN-DSA (Falcon) — for the fn-dsa-verify example
 fn-dsa = { version = "0.3", default-features = false }
 fn-dsa-vrfy = { version = "0.3", default-features = false }
+fn-dsa-comm = { version = "0.3", default-features = false }
 
 # Ethereum/Crypto (for sig-recovery example)
 alloy-primitives = "1"

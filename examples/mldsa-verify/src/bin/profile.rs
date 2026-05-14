@@ -20,7 +20,11 @@ use std::path::PathBuf;
 // in `inventory`.
 use jolt_inlines_keccak256 as _;
 
-use ml_dsa::{MlDsa65, SigningKey};
+use guest::precomputed::{polynomial_to_signed_bytes, serialize_a_hat};
+use ml_dsa::{
+    compute_mu_with_context, compute_tr, expand_a, sample_in_ball, MlDsa65, ParameterSet,
+    SigningKey, VerifyingKeyParams,
+};
 use object::{Object, ObjectSymbol, SymbolKind};
 use rustc_demangle::demangle;
 use signature::{Keypair, Signer};
@@ -90,9 +94,33 @@ fn main() {
     let pk_bytes = vk.encode().to_vec();
     let sig_bytes = signature.encode().to_vec();
 
+    // Host-side precomputation (matches main.rs). See `main.rs` for the
+    // security argument; the profiler doesn't actually verify the proof so
+    // this is just for parity with what the real prover sees.
+    let vk_enc = vk.encode();
+    let (rho, _t1_enc) = MlDsa65::split_vk(&vk_enc);
+    let a_hat = expand_a::<<MlDsa65 as ParameterSet>::K, <MlDsa65 as ParameterSet>::L>(rho);
+    let a_hat_bytes = serialize_a_hat(&a_hat);
+    let tr = compute_tr(&pk_bytes);
+    // Match the public-facing Sign/Verify mu shape (see main.rs comment).
+    let mu = compute_mu_with_context(&tr, &[], &[&msg]);
+    let c = sample_in_ball(signature.c_tilde(), MlDsa65::TAU);
+    let c_bytes = polynomial_to_signed_bytes(&c);
+    let tr_bytes: [u8; 64] = tr.into();
+    let mu_bytes: [u8; 64] = mu.into();
+
     // The macro-generated `trace_*` runs the tracer end-to-end and gives back
     // every row, each one carrying a `NormalizedInstruction { address, .. }`.
-    let trace_out = guest::trace_mldsa_verify(&pk_bytes, &msg, &sig_bytes).expect("tracer failed");
+    let trace_out = guest::trace_mldsa_verify(
+        &pk_bytes,
+        &msg,
+        &sig_bytes,
+        &a_hat_bytes,
+        &tr_bytes,
+        &mu_bytes,
+        &c_bytes,
+    )
+    .expect("tracer failed");
     let rows = trace_out.trace.rows();
     println!("trace length: {} rows", rows.len());
 

@@ -7,13 +7,15 @@ default-run = "mldsa-verify"
 [dependencies]
 jolt-sdk = { workspace = true, features = ["host"] }
 # Pulls in the Keccak inline's `register_inlines!` so the tracer recognises
-# the custom opcodes emitted by `crates/keccak-jolt` in the guest ELF.
+# the custom opcodes emitted by ml-dsa-jolt's SHAKE backend.
 jolt-inlines-keccak256 = { workspace = true, features = ["host"] }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 guest = { package = "mldsa-verify-guest", path = "./guest" }
 
-# Used by the host to generate a test vector that the guest then verifies.
+# Resolves through `[patch.crates-io] ml-dsa = ...` to `crates/ml-dsa-jolt`.
+# The host uses it both to generate a test vector AND to precompute the
+# values (`A_hat`, `tr`, `μ`, `c`) that get passed into the proof as inputs.
 ml-dsa = { version = "0.1.0-rc.11", default-features = false, features = [
   "alloc",
   "rand_core",

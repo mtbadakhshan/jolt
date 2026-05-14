@@ -1,0 +1,61 @@
+[package]
+# Must match the upstream crate name so `[patch.crates-io] fn-dsa-comm = ...`
+# substitutes this crate for `fn-dsa-comm 0.3.0`.
+name = "fn-dsa-comm"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Unlicense"
+description = "Workspace-local fork of `fn-dsa-comm 0.3.0` that routes KeccakState::process() through the Jolt Keccak inline on RISC-V and exports hash_to_point / SHAKE256 as public helpers for host-side precomputation."
+repository = "https://github.com/a16z/jolt"
+
+publish = false
+
+[lib]
+name = "fn_dsa_comm"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Stubs: kept so upstream cfg gates compile without warnings.
+no_avx2 = []
+shake256x4 = []
+
+# Upstream source is vendored verbatim except for shake.rs; suppress
+# clippy pedantry that the upstream doesn't follow.
+[lints.clippy]
+pedantic = "allow"
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+new_without_default = "allow"
+needless_range_loop = "allow"
+collapsible_if = "allow"
+len_zero = "allow"
+too_many_arguments = "allow"
+assertions_on_constants = "allow"
+needless_borrows_for_generic_args = "allow"
+needless_borrow = "allow"
+comparison_chain = "allow"
+identity_op = "allow"
+manual_range_contains = "allow"
+wrong_self_convention = "allow"
+len_without_is_empty = "allow"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[lints.rust]
+unused_results = "allow"
+
+[dependencies]
+rand_core = "0.6"
+
+# RISC-V only: the Jolt Keccak inline opcode.
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+jolt-inlines-keccak256 = { workspace = true }
+
+[dev-dependencies]
+hex = "0.4.3"

@@ -1,0 +1,48 @@
+[package]
+# Must match the upstream crate name so `[patch.crates-io] fn-dsa-vrfy = ...`
+# substitutes this crate for `fn-dsa-vrfy 0.3.0`.
+name = "fn-dsa-vrfy"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.82"
+license = "Unlicense"
+description = "Workspace-local fork of `fn-dsa-vrfy 0.3.0` that adds from_parts / verify_with_precomputed_c entry points so the host can lift hashed_key and hash_to_point out of the proof."
+repository = "https://github.com/a16z/jolt"
+
+publish = false
+
+[lib]
+name = "fn_dsa_vrfy"
+path = "src/lib.rs"
+
+# Upstream source is vendored nearly verbatim; suppress workspace pedantry.
+[lints.clippy]
+pedantic = "allow"
+unwrap_used = "allow"
+expect_used = "allow"
+panic = "allow"
+new_without_default = "allow"
+too_many_arguments = "allow"
+len_zero = "allow"
+needless_range_loop = "allow"
+collapsible_if = "allow"
+manual_range_contains = "allow"
+double_comparisons = "allow"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[lints.rust]
+unused_results = "allow"
+
+[features]
+default = []
+no_avx2 = []
+
+[dependencies]
+fn-dsa-comm = { version = "0.3", default-features = false }
+
+[dev-dependencies]
+hex = "0.4.3"

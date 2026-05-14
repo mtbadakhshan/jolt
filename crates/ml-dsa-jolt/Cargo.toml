@@ -1,0 +1,46 @@
+[package]
+# Must match the upstream crate name so `[patch.crates-io] ml-dsa = ...`
+# substitutes this crate for `ml-dsa 0.1.0-rc.11`.
+name = "ml-dsa"
+version = "0.1.0-rc.11"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+description = "Workspace-local fork of `ml-dsa 0.1.0-rc.11` that routes SHAKE128/256 through the Jolt Keccak inline on RISC-V and exposes precomputed-hash entry points so the host can lift ExpandA / H(pk) / H(tr || M) / SampleInBall out of the proof."
+repository = "https://github.com/a16z/jolt"
+
+# Patched by the Jolt workspace; never published.
+publish = false
+
+[features]
+default = ["alloc"]
+alloc = ["hybrid-array/alloc", "signature/alloc"]
+rand_core = ["common/rand_core", "signature/rand_core"]
+# Stub feature kept only to silence `cfg(feature = "zeroize")` blocks
+# inherited verbatim from upstream. We don't actually pull in the `zeroize`
+# crate, so enabling this feature does nothing.
+zeroize = []
+
+[lib]
+name = "ml_dsa"
+path = "src/lib.rs"
+
+[dependencies]
+# Same upstream deps as `ml-dsa 0.1.0-rc.11`, minus `sha3`, `pkcs8`,
+# `const-oid`, `zeroize`. The `digest` feature on `signature` is dropped
+# because we no longer implement `DigestSigner` / `DigestVerifier`
+# (those traits parameterize over `sha3::Shake256` directly).
+common = { package = "crypto-common", version = "0.2", default-features = false }
+ctutils = { version = "0.4", default-features = false }
+hybrid-array = { version = "0.4", features = ["extra-sizes"] }
+module-lattice = { version = "0.2.3", features = ["ctutils"] }
+signature = { version = "3", default-features = false }
+
+# RISC-V only: compiled away on the host, where we use a soft Keccak-f[1600]
+# permutation ported from the upstream `keccak` crate.
+[target.'cfg(any(target_arch = "riscv32", target_arch = "riscv64"))'.dependencies]
+jolt-inlines-keccak256 = { workspace = true }
+
+[dev-dependencies]
+# Used by upstream `encode.rs` tests (vendored verbatim).
+getrandom = { version = "0.4", features = ["sys_rng"] }

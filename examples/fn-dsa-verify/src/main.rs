@@ -1,10 +1,18 @@
 use std::time::Instant;
 
+// Force-link the Keccak inline crate so its `register_inlines!` static lands
+// in `inventory`. Otherwise the linker drops it (the host binary never
+// references its symbols directly — only the guest does, via fn-dsa-comm-jolt's
+// KeccakState::process).
+use jolt_inlines_keccak256 as _;
+
 use fn_dsa::{
     sign_key_size, signature_size, vrfy_key_size, KeyPairGenerator, KeyPairGeneratorStandard,
     SigningKey, SigningKeyStandard, VerifyingKey, VerifyingKeyStandard, DOMAIN_NONE,
     FN_DSA_LOGN_512, HASH_ID_RAW,
 };
+use fn_dsa_vrfy::{compute_hashed_key, hash_to_point};
+use guest::precomputed::serialize_c;
 use jolt_sdk::serialize_and_print_size;
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -12,9 +20,6 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 pub fn main() {
-    // Default to `info` so the timing/cycle log lines show without the user
-    // having to remember `RUST_LOG=info`. Users can still override via the
-    // env var (e.g. `RUST_LOG=debug` for prover-internal traces).
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -34,8 +39,6 @@ pub fn main() {
     let verify_fn_dsa_verify = guest::build_verifier_fn_dsa_verify(verifier_preprocessing);
 
     // Deterministic FN-DSA-512 keypair derived from a fixed 32-byte seed.
-    // ChaCha20 is a CSPRNG, so this satisfies fn-dsa's
-    // `rand_core::CryptoRng + RngCore` bound while still being reproducible.
     let seed: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0xA5);
     let mut rng = ChaCha20Rng::from_seed(seed);
 
@@ -48,14 +51,9 @@ pub fn main() {
     let msg = b"FN-DSA-512 hello, world!".to_vec();
     let mut sig = vec![0u8; signature_size(sk.get_logn())];
 
-    // FN-DSA signing is randomized (the nonce is freshly sampled). Use a
-    // separate RNG stream so the keypair derivation is independent of the
-    // signing randomness.
     let mut sig_rng = ChaCha20Rng::from_seed([0x5Au8; 32]);
     sk.sign(&mut sig_rng, &DOMAIN_NONE, &HASH_ID_RAW, &msg, &mut sig);
 
-    // Sanity check: the unmodified upstream verifier must accept our
-    // signature before we ask Jolt to prove that acceptance.
     let host_vk = VerifyingKeyStandard::decode(&vrfy_key).expect("decoded our own verifying key");
     assert!(
         host_vk.verify(&sig, &DOMAIN_NONE, &HASH_ID_RAW, &msg),
@@ -69,15 +67,42 @@ pub fn main() {
         msg.len()
     );
 
+    // ---- Host-side precomputation ------------------------------------
+    //
+    // hashed_key = SHAKE256(pk, 64)         ~7 SHAKE256 perms
+    // c = hash_to_point(nonce ‖ hashed_key ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ msg)
+    //                                       ~8 SHAKE256 perms (reject-sample
+    //                                        512 coefficients < q=12289)
+    //
+    // After this split the only Keccak work left inside the proof is NTT
+    // and lattice arithmetic — no SHAKE at all.
+    let hashed_key = compute_hashed_key(&vrfy_key);
+    let n = 1usize << FN_DSA_LOGN_512;
+    let nonce = &sig[1..41];
+    let mut c = vec![0u16; n];
+    hash_to_point(nonce, &hashed_key, &DOMAIN_NONE, &HASH_ID_RAW, &msg, &mut c);
+    let c_bytes = serialize_c(&c);
+    info!("precomputed: hashed_key=64 B, c={} B", c_bytes.len());
+
     let prove_start = Instant::now();
-    let (output, proof, program_io) = prove_fn_dsa_verify(&vrfy_key, &sig, &msg);
+    let (output, proof, program_io) =
+        prove_fn_dsa_verify(&vrfy_key, &sig, &msg, &hashed_key, &c_bytes);
     let prove_elapsed = prove_start.elapsed();
 
     serialize_and_print_size("Proof", "/tmp/fn_dsa_proof.bin", &proof)
         .expect("Could not serialize proof.");
 
     let verify_start = Instant::now();
-    let is_valid = verify_fn_dsa_verify(&vrfy_key, &sig, &msg, output, program_io.panic, proof);
+    let is_valid = verify_fn_dsa_verify(
+        &vrfy_key,
+        &sig,
+        &msg,
+        &hashed_key,
+        &c_bytes,
+        output,
+        program_io.panic,
+        proof,
+    );
     let verify_elapsed = verify_start.elapsed();
 
     info!("guest panicked: {}", program_io.panic);

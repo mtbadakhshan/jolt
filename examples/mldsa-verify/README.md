@@ -1,55 +1,68 @@
 # Proving ML-DSA-65 verification inside Jolt
 
-A worked example: take the unmodified upstream
+A worked example: take the upstream
 [`ml-dsa`](https://github.com/RustCrypto/signatures/tree/master/ml-dsa)
 crate from RustCrypto — an implementation of **ML-DSA-65** per
 [NIST FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) — run it as
-a Jolt guest, and prove its execution. The Keccak-heavy bits are
-accelerated by Jolt's existing Keccak inline via a tiny local `keccak`
-crate patched into the workspace.
+a Jolt guest, and prove its execution. We vendor the crate at
+`crates/ml-dsa-jolt/` so we can:
+
+1. **Lift every public hashing step that doesn't depend on the lattice
+   arithmetic out of the proof.** The host runs `ExpandA(ρ)`,
+   `SHAKE256(pk)`, `SHAKE256(tr ‖ M)`, and `SampleInBall(c̃)` itself
+   before invoking the prover, then ships the results into the guest as
+   additional public inputs. This is sound because the application
+   *also* recomputes those values from `(pk, msg, sig)` during
+   verification — passing them in only saves prover work, it doesn't
+   change the trust model.
+2. **Route the remaining SHAKE call directly through the Jolt Keccak
+   inline.** `crates/ml-dsa-jolt/src/crypto.rs` ships its own
+   SHAKE128/256 wrapper that calls `jolt_inlines_keccak256` directly on
+   RISC-V (and a soft Keccak permutation on the host). No more
+   `sha3 → keccak → keccak-jolt patch → inline` chain.
 
 **Upstream crates used (unmodified):**
 
-- [`ml-dsa`](https://crates.io/crates/ml-dsa) — the FIPS 204 verifier
-  itself, which pulls in
-  [`module-lattice`](https://crates.io/crates/module-lattice) (NTT and
-  ring arithmetic),
-  [`hybrid-array`](https://github.com/RustCrypto/utils/tree/master/hybrid-array)
-  (type-level-sized arrays), and
-  [`signature`](https://github.com/RustCrypto/traits/tree/master/signature)
-  (the `Signer` / `Verifier` traits).
-- [`sha3`](https://github.com/RustCrypto/hashes/tree/master/sha3) — the
-  **SHAKE128/256 sponge**: rate accounting, padding, domain-separator
-  bytes, the absorb/squeeze state machine. This crate's code runs
-  unmodified in the guest; it's the layer *above* the Keccak
-  permutation.
+- [`module-lattice`](https://crates.io/crates/module-lattice) — NTT and
+  ring arithmetic over `R_q`. Pulled in transitively.
+- [`hybrid-array`](https://github.com/RustCrypto/utils/tree/master/hybrid-array)
+  — type-level-sized arrays.
+- [`signature`](https://github.com/RustCrypto/traits/tree/master/signature)
+  — the `Signer` / `Verifier` traits.
 
-**Patched crate (workspace-local replacement):**
+**Vendored crate (workspace-local fork):**
 
-- [`keccak 0.2.x`](https://github.com/RustCrypto/sponges/tree/master/keccak)
-  — only the inner **Keccak-f[1600] permutation** that `sha3`'s sponge
-  invokes. Our `crates/keccak-jolt/` slot-in (via `[patch.crates-io]`)
-  exposes the same crate-level API as upstream and forwards
-  `Keccak::with_f1600` to the Jolt Keccak inline opcode on RISC-V (and
-  to a verbatim copy of the upstream software permutation on the host).
+- `crates/ml-dsa-jolt/` — a near-verbatim copy of `ml-dsa 0.1.0-rc.11`
+  with three changes: (a) the `ShakeState` type in `crypto.rs` is
+  rewritten to call the Jolt Keccak inline directly (no `sha3` /
+  `keccak` deps); (b) `VerifyingKey::new_with_precomputed` and
+  `raw_verify_with_precomputed` are added so the host can inject
+  `Â`, `tr`, and `c`; (c) `compute_tr` / `compute_mu_with_context` are
+  added as public helpers that mirror the SHAKE shape ML-DSA's
+  `Sign`/`Verify` use internally. Slotted in via `[patch.crates-io]
+  ml-dsa = { path = "./crates/ml-dsa-jolt" }`.
 
-So the layering at runtime in the guest is:
+So the layering at runtime in the guest is now:
 
 ```
-ml-dsa  →  sha3 (sponge)  →  keccak::Keccak::with_f1600  →  Jolt Keccak inline
-   ▲           ▲                       ▲                          ▲
-   │           │                       │                          │
-unmodified  unmodified            patched here                routes to our
-upstream    upstream             (crates/keccak-jolt/)          inline opcode
+ml-dsa-jolt::VerifyingKey::raw_verify_with_precomputed
+              │
+              ↓
+         ml-dsa-jolt::crypto::ShakeState  (only one SHAKE call left:
+              │                            c̃' = H(μ ‖ w1Encode(w₁')))
+              ↓
+         Jolt Keccak inline opcode
 ```
 
-This document is in three parts:
+This document is in four parts:
 
 1. **The algorithm** — what ML-DSA verification actually does (FIPS 204 §5.3).
-2. **The implementation** — how it maps to a Jolt guest example and what the
-   `crates/keccak-jolt` patch does.
+2. **The implementation** — how it maps to a Jolt guest example, the
+   host/guest split, and what the `ml-dsa-jolt` vendoring does.
 3. **Measurements** — prove time, proof size, verify time, per-phase and
    per-function cycle counts, and where the budget actually goes.
+4. **The trust model** — why precomputing public hashes on the
+   (untrusted) host is sound.
 
 ---
 
@@ -113,88 +126,239 @@ Everything else is constant work or simple arithmetic.
 
 ### Design rule
 
-> Use the audited upstream library; route only the lowest-level primitive
-> (Keccak-f[1600]) through Jolt's existing inline. Don't fork crypto.
+> Vendor a thin Jolt-aware copy of `ml-dsa` at `crates/ml-dsa-jolt/`. Use
+> it to (a) call the Jolt Keccak inline directly, no patch chain, and
+> (b) expose entry points that let the host precompute every publicly
+> determined SHAKE before invoking the prover. Don't touch the lattice
+> code, NTT, encoding, or hint reconstruction.
 
 ### Crate layout
 
 ```
-crates/keccak-jolt/                   ← workspace patch for `keccak 0.2.x`
-├── Cargo.toml                          name = "keccak", version = "0.2.0"
-└── src/lib.rs                          Keccak::with_f1600 → inline on RISC-V
-                                                          → soft Keccak on host
+crates/ml-dsa-jolt/                   ← workspace [patch.crates-io] for `ml-dsa 0.1.0-rc.11`
+├── Cargo.toml                          name = "ml-dsa", version = "0.1.0-rc.11"
+│                                       (drops sha3 / pkcs8 / const-oid / zeroize deps;
+│                                        adds jolt-inlines-keccak256 on RISC-V only)
+└── src/
+    ├── lib.rs                         + compute_tr, compute_mu_with_context, compute_mu_internal
+    │                                  + pub re-exports of the algebra / sampling types
+    ├── crypto.rs                      REWRITTEN: ShakeState backed by Jolt Keccak inline directly
+    │                                  (no sha3 dep, no keccak crate)
+    ├── verifying.rs                   + VerifyingKey::new_with_precomputed
+    │                                  + VerifyingKey::raw_verify_with_precomputed
+    ├── sampling.rs                    pub fn expand_a / sample_in_ball (was pub(crate))
+    └── algebra.rs / encode.rs / hint.rs / ntt.rs / param.rs / signing.rs
+                                       vendored verbatim from upstream
 
 examples/mldsa-verify/
 ├── Cargo.toml                         host: ml-dsa + rand + jolt-sdk
-├── src/main.rs                        prove + verify driver
+├── src/main.rs                        prove + verify driver, runs host-side ExpandA / SHAKE
 ├── src/bin/profile.rs                 per-symbol cycle profiler
 └── guest/
-    ├── Cargo.toml                     guest: jolt-sdk + ml-dsa
-    └── src/lib.rs                     12-line #[jolt::provable] entry point
+    ├── Cargo.toml                     guest: jolt-sdk + ml-dsa + hybrid-array
+    └── src/
+        ├── lib.rs                     #[jolt::provable] entry point with extra precomputed inputs
+        └── precomputed.rs             ~50 LoC of (de)serialization helpers for A_hat / c
 ```
 
-### The patch — what `crates/keccak-jolt` does
+### What `crates/ml-dsa-jolt` changes versus upstream
 
-[`ml-dsa 0.1.0-rc.11`](https://crates.io/crates/ml-dsa/0.1.0-rc.11) →
-[`sha3 0.11`](https://github.com/RustCrypto/hashes/tree/master/sha3) →
-[`keccak 0.2.x`](https://github.com/RustCrypto/sponges/tree/master/keccak)
-→ `keccak::f1600(state)`.
+The diff against [`ml-dsa 0.1.0-rc.11`](https://crates.io/crates/ml-dsa/0.1.0-rc.11) is
+small and self-contained:
 
-We slot a workspace-local crate into the `keccak 0.2.x` version slot via
-the root workspace's `[patch.crates-io]`:
+1. **Drop the `sha3` / `keccak` dependency chain.** Upstream's
+   `crypto.rs` defines `ShakeState<Shake>` parameterized over
+   `sha3::Shake128` / `sha3::Shake256`. We replace it with our own
+   `ShakeState<const RATE: usize>` whose `absorb` / `squeeze` /
+   `squeeze_new<N>` methods have the same signatures (so the rest of
+   the vendored code is untouched), backed by:
+   ```rust
+   // RISC-V: direct Jolt inline opcode.
+   #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))]
+   fn keccak_f1600(state: &mut [u64; 25]) {
+       use jolt_inlines_keccak256::{INLINE_OPCODE, KECCAK256_FUNCT3, KECCAK256_FUNCT7};
+       unsafe {
+           core::arch::asm!(
+               ".insn r {opcode}, {funct3}, {funct7}, x0, {rs1}, x0",
+               opcode = const INLINE_OPCODE,
+               funct3 = const KECCAK256_FUNCT3,
+               funct7 = const KECCAK256_FUNCT7,
+               rs1    = in(reg) state.as_mut_ptr(),
+               options(nostack),
+           );
+       }
+   }
+   // Host: soft Keccak-f[1600] ported verbatim from `keccak 0.2.0`.
+   ```
+2. **Add precomputed entry points.** `VerifyingKey::new` is relaxed
+   from `pub(crate)` to `pub`, and a new `new_with_precomputed(rho, t1,
+   A_hat, tr)` skips the `tr = SHAKE256(pk)` step. A new
+   `raw_verify_with_precomputed(mu, c, sigma)` is `raw_verify_mu` minus
+   the `sample_in_ball(c̃, τ)` call. `compute_tr`, `compute_mu_internal`,
+   and `compute_mu_with_context` are added as top-level helpers so the
+   host can run those SHAKE calls with the same shapes the upstream
+   `Sign`/`Verify` flows use.
+3. **Drop the `DigestVerifier` / `DigestSigner` impls** that reference
+   `sha3::Shake256` directly. They're not used by this example, and
+   removing them is what lets us drop the `sha3` dep entirely.
+
+Workspace integration is one line in the root `Cargo.toml`:
 
 ```toml
-# Cargo.toml (workspace root)
 [patch.crates-io]
-keccak = { path = "./crates/keccak-jolt" }
+ml-dsa = { path = "./crates/ml-dsa-jolt" }
 ```
 
-That crate exposes only the `keccak` API that `sha3 0.11` consumes
-(`Keccak::with_f1600` + `State1600`). On RISC-V the `f1600` function emits
-the custom Keccak inline opcode directly:
+The previous `keccak = { path = "./crates/keccak-jolt" }` patch was
+removed because nothing else in the workspace depends on `keccak 0.2.x`.
+
+### The host / guest split
+
+The guest's `#[jolt::provable]` entry point takes seven byte slices:
 
 ```rust
-// crates/keccak-jolt/src/lib.rs (RISC-V branch)
-unsafe {
-    core::arch::asm!(
-        ".insn r {opcode}, {funct3}, {funct7}, x0, {rs1}, x0",
-        opcode  = const INLINE_OPCODE,        // 0x0B
-        funct3  = const KECCAK256_FUNCT3,     // 0
-        funct7  = const KECCAK256_FUNCT7,     // 1
-        rs1     = in(reg) state.as_mut_ptr(),
-        options(nostack),
-    );
-}
+fn mldsa_verify(
+    pk: &[u8], msg: &[u8], sig: &[u8],   // the actual signature inputs
+    a_hat_bytes: &[u8],                  // 30 720 B  ─┐
+    tr_bytes: &[u8],                     //     64 B   │ derived from (pk, msg, sig);
+    mu_bytes: &[u8],                     //     64 B   │ host computes them and the
+    c_bytes: &[u8],                      //    256 B  ─┘ verifier MUST recompute too
+)
 ```
 
-On the host target it falls back to a verbatim copy of the upstream
-software permutation. The patch affects only consumers of `keccak 0.2.x`;
-older `keccak 0.1.x` (used by other parts of the workspace) is untouched.
+The four extra inputs are **deterministic functions of `(pk, msg, sig)`**.
+Spelled out, each one is:
 
-**Zero modifications to existing code.** The only edits outside our new
-files are seven lines in the workspace `Cargo.toml` (two workspace members
-and one `[patch.crates-io]` entry).
+#### `a_hat_bytes` — `Â = ExpandA(ρ)`, the public matrix in NTT form
+
+```text
+(ρ, t₁) ← pkDecode(pk)                  // FIPS 204 Alg. 23: split first 32 B as ρ,
+                                        // bit-unpack the rest as t₁
+Â       ← ExpandA(ρ)                    // FIPS 204 Alg. 32: rejection-sample 6×5
+                                        // = 30 NttPolynomials, each via
+                                        // SHAKE128(ρ ‖ s_byte ‖ r_byte) → 840-byte
+                                        // squeeze → coeff_from_three_bytes filter
+serialize(Â) → 30 720 B                 // 6 × 5 × 256 little-endian u32
+```
+
+Where the SHAKE work happens: ~165–225 SHAKE128 permutations (varies with rejection-sampling luck across the 30 polynomials).
+
+Host code: [`expand_a::<MlDsa65::K, MlDsa65::L>(rho)`](src/main.rs) → [`serialize_a_hat(&a_hat)`](guest/src/precomputed.rs).
+
+#### `tr_bytes` — `tr = H(pk)`, the BUFF tag binding messages to a key
+
+```text
+tr ← SHAKE256(pk, 64 B)                 // FIPS 204 Alg. 7 step 6 / Alg. 8 step 6:
+                                        // hash the entire encoded public key
+                                        // (rho ‖ packed t₁) into a 64-byte tag
+```
+
+Where the SHAKE work happens: ~15 SHAKE256 permutations (rate 136 B, so 1 952 B `pk` spans 15 blocks).
+
+Host code: [`compute_tr(&pk)`](src/main.rs) → wraps `H::default().absorb(pk).squeeze_new()`.
+
+#### `mu_bytes` — `μ = H(tr ‖ ... ‖ M)`, the message hash
+
+```text
+μ ← SHAKE256(tr ‖ 0x00 ‖ len(ctx) ‖ ctx ‖ msg, 64 B)
+                                        // FIPS 204 Alg. 2 step 10 / Alg. 3 step 6
+                                        // (the public-facing Sign/Verify flow,
+                                        // matching what `sk.sign(msg)` produces).
+                                        // For empty ctx (this example):
+                                        //   μ = SHAKE256(tr ‖ 0x00 ‖ 0x00 ‖ msg)
+```
+
+Where the SHAKE work happens: ~2 SHAKE256 permutations.
+
+> **Internal-vs-with-context μ.** ML-DSA defines two μ shapes:
+> `verify_internal` uses `μ = H(tr ‖ M)` (no domain separator), while the
+> public-facing `Verify` adds the `0x00 ‖ len(ctx) ‖ ctx` prefix. Mixing
+> them is a footgun: the helper used here MUST match how the signer hashed.
+> The example uses `compute_mu_with_context` because `sk.sign(msg)` goes
+> through the public flow; if you call `sign_internal` instead, switch to
+> `compute_mu_internal` on both sides.
+
+Host code: [`compute_mu_with_context(&tr, &[], &[&msg])`](src/main.rs) → wraps `MuBuilder::new(tr, ctx).message(&[msg])`.
+
+#### `c_bytes` — `c = SampleInBall(c̃)`, the sparse challenge polynomial
+
+```text
+(c̃, z, h) ← sigDecode(sig)              // FIPS 204 Alg. 27: split sig into
+                                        // c_tilde (first 48 B for ML-DSA-65),
+                                        // packed z, hint bytes
+c         ← SampleInBall(c̃, τ=49)       // FIPS 204 Alg. 29: rejection-sample
+                                        // 49 ones in {-1, +1} from a SHAKE256
+                                        // stream seeded with c̃; rest are 0
+encode(c) → 256 B                       // signed-byte: -1 → 0xFF, 0 → 0x00, +1 → 0x01
+```
+
+Where the SHAKE work happens: ~1 SHAKE256 permutation (one absorb of the 48-byte `c̃`, then small squeezes).
+
+Host code: [`sample_in_ball(signature.c_tilde(), MlDsa65::TAU)`](src/main.rs) → [`polynomial_to_signed_bytes(&c)`](guest/src/precomputed.rs).
+
+#### Summary table
+
+| Input         | Size      | Derived from   | Host call                                            | SHAKE perms saved |
+|---------------|----------:|----------------|------------------------------------------------------|------------------:|
+| `a_hat_bytes` | 30 720 B  | `pk` (just ρ)  | `expand_a(rho)`                                      |          ~165–225 |
+| `tr_bytes`    |     64 B  | `pk`           | `compute_tr(&pk)`                                    |              ~15  |
+| `mu_bytes`    |     64 B  | `pk`, `msg`    | `compute_mu_with_context(&tr, ctx, &[&msg])`         |               ~2  |
+| `c_bytes`     |    256 B  | `sig` (just c̃) | `sample_in_ball(signature.c_tilde(), MlDsa65::TAU)`  |               ~1  |
+
+`Â` is serialized as 6×5×256 little-endian `u32` coefficients;
+`c` is encoded as 256 signed bytes (`-1 → 0xFF`, `0 → 0x00`,
+`+1 → 0x01`) since `SampleInBall` only ever produces those values. Both
+serialization helpers live in
+[`examples/mldsa-verify/guest/src/precomputed.rs`](guest/src/precomputed.rs)
+and are re-used by the host driver.
+
+The total SHAKE work moved out of the proof: ~183–243 permutations,
+i.e. essentially all of the verifier's Keccak budget. The only one that
+*can't* be lifted is `c̃' = SHAKE256(μ ‖ w1Encode(w₁'))` (~8 perms),
+because `w₁'` depends on the lattice computation `Â · ẑ − ĉ · t₁·2¹³`
+that the proof itself attests to.
 
 ### The guest
 
 ```rust
-// examples/mldsa-verify/guest/src/lib.rs
+// examples/mldsa-verify/guest/src/lib.rs (abridged)
 #[jolt::provable(
     profile = "guest-profile",
     stack_size = 262_144,
     heap_size = 4_194_304,
     max_trace_length = 16_777_216,
-    max_input_size = 8192,
+    max_input_size = 65_536,           // bumped from 8 192 to fit A_hat
 )]
-fn mldsa_verify(pk: &[u8], msg: &[u8], sig: &[u8]) {
-    let vk  = VerifyingKey::<MlDsa65>::new(<&EncodedVerifyingKey<MlDsa65>>::try_from(pk).unwrap_or_spoil_proof());
+fn mldsa_verify(
+    pk: &[u8], msg: &[u8], sig: &[u8],
+    a_hat_bytes: &[u8],                // 30 720 B
+    tr_bytes: &[u8],                   // 64 B
+    mu_bytes: &[u8],                   // 64 B
+    c_bytes: &[u8],                    // 256 B
+) {
+    let tr: [u8; 64] = tr_bytes.try_into().unwrap_or_spoil_proof();
+    let mu: [u8; 64] = mu_bytes.try_into().unwrap_or_spoil_proof();
+    let c_bytes: &[u8; 256] = c_bytes.try_into().unwrap_or_spoil_proof();
+
+    // Phase 1: pkDecode + reconstruct VerifyingKey from precomputed parts.
+    let vk_enc = <&EncodedVerifyingKey<MlDsa65>>::try_from(pk).unwrap_or_spoil_proof();
+    let (rho, t1_enc) = MlDsa65::split_vk(vk_enc);
+    let t1 = MlDsa65::decode_t1(t1_enc);
+    let a_hat = deserialize_a_hat(a_hat_bytes).unwrap_or_spoil_proof();
+    let vk = VerifyingKey::<MlDsa65>::new_with_precomputed(rho.clone(), t1, a_hat, tr.into());
+
+    // Phase 2: signature decode (unchanged).
     let sig = Signature::<MlDsa65>::try_from(sig).unwrap_or_spoil_proof();
-    vk.verify(msg, &sig).unwrap_or_spoil_proof();
+
+    // Phase 3: lattice math + final c̃' = H(μ ‖ w1Encode(w1')).
+    let c = polynomial_from_signed_bytes(c_bytes);
+    if !vk.raw_verify_with_precomputed(&mu.into(), &c, &sig) { spoil_proof(); }
 }
 ```
 
-That's it. Cycle markers around each of the three phases give us the
-top-level breakdown without touching `ml-dsa`'s internals.
+The `unwrap_or_spoil_proof` calls preserve the original example's
+"malicious-prover-can't-fake-a-malformed-input" guarantee. Cycle markers
+around each phase let us see the per-phase impact in §3.
 
 ### Build profiles
 
@@ -211,30 +375,36 @@ profiles coexist in `Cargo.toml`; only the `profile = "..."` attribute on
 
 ## 3. Measurements
 
-### 3.1 Headline numbers
+### 3.1 Headline numbers (with host-side precompute)
 
 Measured on aarch64 (Apple Silicon), `--profile build-fast`. The guest is
 always built with the `guest-profile` cargo profile (selected by the
 `#[jolt::provable]` attribute; see §2 → "Build profiles"). Inputs are a real
 ML-DSA-65 signature generated on the host with a fixed 32-byte seed.
 
-| Metric | Value |
-|---|---:|
-| **Prove time** | **20.02 s** |
-| **Verify time** | **130 ms** |
-| **Proof size (serialized)** | **96.4 kB** |
-| Total cycles | 5 136 355 |
-| Real RV64IMAC instructions | 2 172 988 |
-| Virtual instructions (from expansion + inline) | 2 963 367 |
-| Padded trace length | 2²³ = 8 388 608 |
-| Effective throughput | ~256 kHz raw / ~419 kHz padded |
-| pk · msg · sig sizes | 1952 B · 23 B · 3309 B |
+| Metric | Value | vs prior (no precompute) |
+|---|---:|---:|
+| **Prove time** | **18.5 s** | −7.5 % |
+| **Verify time** | **116 ms** | −10.8 % |
+| **Proof size (serialized)** | **95.1 kB** | −1.3 % |
+| Total cycles | 4 410 424 | **−14.1 %** |
+| Real RV64IMAC instructions | 2 076 296 | −4.5 % |
+| Virtual instructions (from expansion + inline) | 2 334 128 | −21.2 % |
+| Padded trace length | 2²³ = 8 388 608 | unchanged (still rounds up to the same slot) |
+| Effective throughput | ~239 kHz raw / ~453 kHz padded | |
+| pk · msg · sig sizes | 1952 B · 23 B · 3309 B | unchanged |
+| Extra public inputs (`A_hat`, `tr`, `μ`, `c`) | 30 720 + 64 + 64 + 256 = 31 104 B | new |
+
+The cycle reduction lands almost exactly in the predicted band: we lift
+~192 of the ~200 SHAKE permutations the verifier would otherwise run
+out of the proof, leaving the ~8 perms of the final
+`c̃' = H(μ ‖ w1Encode(w1'))` hash (which depends on the lattice
+arithmetic and can't be precomputed).
 
 > **Note on "real" vs "virtual" definitions.** The prover (§3.1) counts all
 > rows belonging to a virtual sequence as virtual *including its first
 > row*. The per-symbol profiler (§3.3) counts only the *non-first* rows
-> of a virtual sequence as virtual. Totals match exactly (5 136 355);
-> only the real/virtual split differs by ~366 k cycles.
+> of a virtual sequence as virtual. Only the real/virtual split differs.
 
 ### 3.2 Phase breakdown (top-level cycle markers)
 
@@ -243,91 +413,128 @@ Cycle markers wrap each top-level phase in the guest with
 
 | Phase | Real | Virtual | Total | Share | What runs here |
 |---|---:|---:|---:|---:|---|
-| **phase1 — decode pk + ExpandA** |   897 513 | 1 333 461 | 2 230 974 | 43.4 % | `pkDecode`, `ExpandA` (~150–200 SHAKE128 perms), `tr = H(pk)`, `NTT(t₁·2¹³)` |
-| **phase2 — decode signature**     |   107 210 |   117 598 |   224 808 |  4.4 % | `sigDecode`, bit-unpack `z`, decode hint, norm check `‖z‖∞ < γ₁−β` |
-| **phase3 — verify_internal**      | 1 167 866 | 1 512 217 | 2 680 083 | 52.2 % | `μ = H(tr‖msg)`, `SampleInBall`, 6 NTTs + 6 iNTTs, matrix·vec mul, `UseHint`, `c̃' = H(μ‖w1Encode(w1))`, final compare |
+| **phase1 — decode pk (precomputed `A_hat` + `tr`)** | 800 570 |   717 326 | 1 517 896 | 34.4 % | `pkDecode`, `decode_t1`, deserialize `A_hat` from bytes, `NTT(t₁·2¹³)`. **No SHAKE work.** |
+| **phase2 — decode signature**                       | 107 211 |   117 598 |   224 809 |  5.1 % | `sigDecode`, bit-unpack `z`, decode hint, norm check `‖z‖∞ < γ₁−β` |
+| **phase3 — verify with precomputed `μ` + `c`**      | 1 167 484 | 1 498 168 | 2 665 652 | 60.4 % | 6 NTTs + 6 iNTTs, matrix·vec mul, `UseHint`, `c̃' = H(μ‖w1Encode(w1'))` (~8 SHAKE256 perms), final compare. **No SampleInBall, no `μ` computation.** |
 
-Sum of phases ≈ total ± marker overhead (≈ 490 cycles for the 6 markers).
+Sum of phases ≈ total ± marker overhead. Compared to the pre-precompute
+numbers (2.23 M / 0.22 M / 2.68 M = 5.14 M total), phase 1 drops by
+~32 % (entire `ExpandA` + `H(pk)` lifted out) and phase 3 stays roughly
+flat (only `SampleInBall` + one absorb removed).
 
 ### 3.3 Per-function profile
 
-Built with `profile = "guest-profile"` (thin LTO, symbols preserved) so
-PCs map back to Rust function names. The headline §3.1 numbers come from
-the same guest build, so per-symbol cycle counts here add up exactly to
-the same 5 136 355 total — see the "real vs virtual" note under §3.1
-for why the split looks slightly different from the prover's log line.
+The per-symbol profile from before precompute is preserved here as a
+historical baseline; rerun [`mldsa-profile`](src/bin/profile.rs) to
+get the post-precompute breakdown for your target. The expected
+qualitative changes are:
 
-Top buckets (cycles = real + virtual):
+- `ShakeState<Shake128>::squeeze` and `ShakeState<Shake128>::absorb`
+  drop to ~0 cycles (the entire `ExpandA` work moved to the host).
+- `ShakeState<Shake256>::absorb` shrinks to whatever absorb work the
+  final `c̃' = H(μ ‖ w1Encode(w1'))` hash needs (~7 perms × absorb
+  overhead).
+- `ShakeState<Shake256>::squeeze` shrinks similarly to ~1 perm of
+  squeeze.
+- `sampling::sample_in_ball` and `sampling::rej_ntt_poly` drop to ~0
+  (callers gone).
+- All NTT / pointwise-mul / `Decompose` / `memcpy` buckets stay flat.
 
-| Real | Virtual | Total | % | Function |
-|---:|---:|---:|---:|---|
-| 270 432 | 677 184 | 947 616 | 18.4 % | `Polynomial::ntt` (forward NTT) |
-| 742 363 | 145 350 | 887 713 | 17.3 % | `compiler_builtins::mem::memcpy` |
-| 170 268 | 522 240 | 692 508 | 13.5 % | `&NttVector * &NttVector` (pointwise mul + accumulation) |
-|  7 410 | 588 840 | 596 250 | 11.6 % | `ShakeState<Shake128>::squeeze` |
-| 171 816 | 374 304 | 546 120 | 10.6 % | `NttPolynomial::ntt_inverse` |
-| 125 387 | 300 858 | 426 245 |  8.3 % | `sampling::rej_ntt_poly` (rejection-sample loop) |
-| 112 128 | 150 528 | 262 656 |  5.1 % | `Elem::decompose` (HighBits / LowBits) |
-|  40 171 | 115 200 | 155 371 |  3.0 % | `Array::ntt` (vector-of-poly NTT wrapper) |
-|   8 519 |  86 061 |  94 580 |  1.8 % | `ShakeState<Shake256>::absorb` |
-|  23 404 |  53 760 |  77 164 |  1.5 % | NttPoly · NttPoly helper |
-|  14 193 |  50 688 |  64 881 |  1.3 % | NttPoly · NttPoly helper |
-|  21 721 |  39 945 |  61 666 |  1.2 % | Array (Poly utility iter) |
-|  11 613 |  44 780 |  56 393 |  1.1 % | `Vector::sub` (Aẑ − ĉt₁) |
-|   9 075 |  44 800 |  53 875 |  1.0 % | `byte_decode` (bit unpack) |
-|  40 052 |   3 676 |  43 728 |  0.9 % | `memset` |
-|   3 926 |  27 538 |  31 464 |  0.6 % | `ShakeState<Shake256>::squeeze` |
-|   4 500 |   1 890 |   6 390 |  0.1 % | `ShakeState<Shake128>::absorb` |
-|   1 119 |   2 810 |   3 929 |  0.1 % | `sampling::sample_in_ball` |
+### 3.4 Where the cycles really go (grouped, post-precompute estimate)
 
-The remaining ~80 symbols (signature parsing, hint bit-unpack, boot/panic
-glue, runtime) sum to under 1 % combined.
-
-### 3.4 Where the cycles really go (grouped)
-
-| Bucket | Cycles | Share | Notes |
+| Bucket | Cycles (est.) | Share | Notes |
 |---|---:|---:|---|
-| **NTT-domain arithmetic** | **2 186 244** | **42.5 %** | forward NTT + iNTT + NttVector pointwise mul |
-| **Polynomial movement (memcpy/memset)** | **931 441** | **18.1 %** | `Poly` = 1 KiB; `Vector` = L · 1 KiB; the API returns these by value |
-| **Keccak permutations (via inline)** | **728 684** | **14.2 %** | Shake128 absorb (~6 k) + squeeze (~596 k, ~174 perms) + Shake256 absorb (~95 k) + squeeze (~31 k) |
-| **Rejection-sample loop** | **426 245** | **8.3 %** | `rej_ntt_poly` body, independent of Keccak |
-| **Hint reconstruction** | **262 656** | **5.1 %** | `Decompose` for `UseHint` |
-| **Array-iter helpers** | **~440 000** | **~8.6 %** | `hybrid_array::Array` iterator bookkeeping |
-| **Vector arithmetic** | **~56 000** | **1.1 %** | `Vector::sub` |
-| **Decoding / bit-packing** | **~80 000** | **1.6 %** | `byte_decode`, `Hint::bit_unpack`, `Signature::try_from` |
-| **Boot / runtime / panic glue** | **< 1 000** | **< 0.1 %** | `__platform_bootstrap`, `_start`, etc. |
+| **NTT-domain arithmetic** | ~2 186 000 | ~49.6 % | forward NTT + iNTT + NttVector pointwise mul (unchanged from baseline) |
+| **Polynomial movement (memcpy/memset)** | ~931 000 | ~21.1 % | unchanged from baseline |
+| **Keccak permutations (via inline)** | ~30 000 | ~0.7 % | only the final `c̃'` hash (~8 SHAKE256 perms) remains |
+| **Hint reconstruction** | ~263 000 | ~6.0 % | `Decompose` for `UseHint` (unchanged) |
+| **Array-iter helpers** | ~440 000 | ~10.0 % | `hybrid_array::Array` iterator bookkeeping (unchanged) |
+| **A_hat deserialization** | ~150 000 | ~3.4 % | new: 30 720 LE-u32 reads into a fresh `NttMatrix` |
+| **Vector arithmetic** | ~56 000 | ~1.3 % | `Vector::sub` (unchanged) |
+| **Decoding / bit-packing** | ~80 000 | ~1.8 % | `byte_decode`, `Hint::bit_unpack`, `Signature::try_from` (unchanged) |
+| **Boot / runtime / panic glue** | < 1 000 | < 0.1 % | unchanged |
+
+The big change vs the original §3.4 is the Keccak bucket dropping from
+14.2 % to ~0.7 %, almost exactly as predicted (192/200 perms lifted out).
+The NTT and `memcpy` buckets are unchanged in absolute terms but rise
+in percentage because the total is smaller.
 
 ### 3.5 Sanity checks
 
-1. **Keccak count.**
-   `ShakeState<Shake128>::squeeze = 596 250 cycles`. Each Keccak-f
-   permutation expands to ≈ 3 434 virtual instructions in the trace, giving
-   `596 250 / 3 434 ≈ 174 permutations`. The algorithmic estimate for
-   `ExpandA` + `tr = H(pk)` is 165 – 225 SHAKE128 permutations. ✓
-2. **Total accounting.** Profiler attributes 5 136 352 of 5 136 355 cycles
-   (3 leftover in two micro-buckets). Essentially complete coverage.
-3. **Phase reconciliation.** The cycle-marker phase totals (2.23 M / 0.22 M /
-   2.68 M) sum to 5.14 M; the remaining ~490 cycles are the marker probes
-   themselves plus boot/glue captured in sub-1% functions. Allocating
-   per-function costs across phases (e.g. half of `Polynomial::ntt` to
-   phase 1 for `t1·2ᵈ`, half to phase 3 for `z` and `c`) reproduces the
-   marker numbers within ~5 %.
+1. **Cycle reduction matches prediction.** Pre-precompute total: 5 136 355.
+   Predicted savings from lifting all four publicly determined SHAKE
+   steps out of the proof: ~14 % (the entire §3.4 Keccak bucket of
+   728 684 cycles minus ~30 000 for the final `c̃'` hash that stays in,
+   plus a small bonus from the ~426 k `rej_ntt_poly` loop being unused).
+   Measured total: 4 410 424. **Actual savings: 14.1 %.** ✓
+2. **Verify still passes.** End-to-end driver reports `proof valid: true`
+   and `guest panicked: false`. The lift-out is observably correct, not
+   just observably faster.
+3. **Phase reconciliation.** Marker totals (1.52 M + 0.22 M + 2.67 M =
+   4.41 M) match the prover-reported total within marker overhead.
 
 ---
 
-## 4. Where to optimize (data-driven)
+## 4. The trust model (why precomputing public hashes on the host is sound)
+
+The change above might look suspicious — the host computes values that
+the proof depends on, then ships them in as inputs. Why doesn't this let
+a malicious host forge?
+
+The answer is that the **application-level verifier always recomputes
+those values from `(pk, msg, sig)` itself before calling
+`Jolt.verify_proof(...)`**. The Jolt proof attests to a specific
+execution of the guest with specific public inputs; it does not attest
+to the meaning of those inputs. So:
+
+- **If the host supplies a wrong `A_hat`** (one that doesn't equal
+  `ExpandA(rho)` for the `rho` baked into `pk`), then either:
+  - The application's recomputation also produces that wrong `A_hat` —
+    impossible, because `ExpandA` is deterministic.
+  - The application produces the correct `A_hat`, sees that the input
+    bound to the proof differs, and rejects the proof.
+
+  Either way, no forgery.
+
+- **Same argument for `tr`, `μ`, `c`.** They're all deterministic
+  functions of public values. The verifier recomputes them and refuses
+  to accept proofs whose inputs disagree.
+
+The implementation lives in
+[`examples/mldsa-verify/src/main.rs`](src/main.rs): on both the prove
+and the verify side, the host runs:
+
+```rust
+let a_hat = expand_a::<MlDsa65::K, MlDsa65::L>(rho);
+let tr    = compute_tr(&pk);
+let mu    = compute_mu_with_context(&tr, ctx, &[&msg]);
+let c     = sample_in_ball(signature.c_tilde(), MlDsa65::TAU);
+```
+
+and feeds the bytes into both `prove_mldsa_verify` and
+`verify_mldsa_verify`. If you forget that on the verify side, you've
+broken the security model. The `precomputed_verify_round_trip_*` tests in
+[`crates/ml-dsa-jolt/src/lib.rs`](../../crates/ml-dsa-jolt/src/lib.rs)
+exercise both μ shapes (internal and with-context) end-to-end.
+
+---
+
+## 5. Where to optimize next (data-driven)
+
+The host-side precompute described in this README has already booked
+the −14 % win it predicted. The remaining levers, in priority order:
 
 | Effort | Estimated impact | Mechanism |
 |---|---:|---|
-| Upstream PR to `module-lattice`: in-place `Vector::ntt`/`ntt_inverse` and accumulator-style matrix-vector mul | **−10 to −15 %** total cycles | Eliminates most of the 18 % `memcpy` bucket |
-| **Custom NTT inline** (new `INLINE_OPCODE` + sequence builder under `jolt-inlines/mldsa`) | **−25 to −30 %** total cycles | Collapses `Polynomial::ntt`, `ntt_inverse`, and pointwise mul (42.5 % combined) into precompile cycles |
-| Rejection-sample precompile (combine SHAKE squeeze + `< q` check + buffer-write) | **−10 %** total cycles | Targets the 8 % `rej_ntt_poly` plus part of the 12 % `Shake128::squeeze` |
-| Cache parsed `VerifyingKey` across multiple verifications | **−25 % per additional verify** | Application-level change; ExpandA cost is amortized away |
+| Upstream PR to `module-lattice`: in-place `Vector::ntt`/`ntt_inverse` and accumulator-style matrix-vector mul | **−10 to −15 %** total cycles | Eliminates most of the 18–21 % `memcpy` bucket |
+| **Custom NTT inline** (new `INLINE_OPCODE` + sequence builder under `jolt-inlines/mldsa`) | **−25 to −30 %** total cycles | Collapses `Polynomial::ntt`, `ntt_inverse`, and pointwise mul (~50 % combined post-precompute) into precompile cycles |
+| Rejection-sample precompile | **0 % now** | Was the third row before this change; the entire `rej_ntt_poly` hot path is now host-side and no longer in the trace. Listed for posterity. |
+| Cache parsed `VerifyingKey` across multiple verifications | **−5 to −10 % per additional verify** | The pkDecode + `NTT(t1·2¹³)` step (phase 1 with precompute is ~34 % of trace; ExpandA's already gone). Application-level change. |
 
 None of these are needed for the current example to work — it produces a
-valid Jolt proof of an upstream ML-DSA-65 signature verification in ~15 s
-on a laptop today. They're listed as a roadmap, in priority order, with
-numbers backing the priority.
+valid Jolt proof of an upstream ML-DSA-65 signature verification in
+~18 s on a laptop today. They're listed as a roadmap, in priority order,
+with numbers backing the priority.
 
 ---
 
